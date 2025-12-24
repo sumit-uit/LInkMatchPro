@@ -1,0 +1,7 @@
+{
+  "name": "LinkMatch Pro",
+  "description": "A networking platform that generates professional cards from LinkedIn profiles using QR scanning and AI matching.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
