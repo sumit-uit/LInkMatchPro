@@ -1,9 +1,19 @@
 
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Profile, NetworkingSynergy } from './types';
 import { enrichProfile, analyzeRoomSynergies } from './services/geminiService';
 import { dbService, supabase } from './services/supabaseService';
 import { ProfileCard } from './components/ProfileCard';
+
+/**
+ * STRATEGY: FEATURE_FLAGS
+ */
+const FEATURE_FLAGS = {
+  LINKPRO: true,
+  RESUME_INTEL: false, 
+  VISION_DECK: false,
+  DIGITAL_TWIN: false
+};
 
 type AppRole = 'none' | 'host' | 'participant' | 'viewer';
 type ViewState = 'hub' | 'linkmatch';
@@ -36,9 +46,20 @@ export default function App() {
 
   const lastAnalyzedFingerprint = useRef("");
 
+  /**
+   * ROUTING & DEEP LINK HANDLING
+   */
   useEffect(() => {
     const handleRoute = () => {
       const hash = window.location.hash;
+      const params = new URLSearchParams(window.location.search);
+      const roomParam = params.get('room');
+
+      if (roomParam?.length === 6 && !hash.startsWith('#/app/linkpro')) {
+        window.location.hash = '#/app/linkpro';
+        return;
+      }
+
       if (hash.startsWith('#/app/linkpro')) {
         setActiveView('linkmatch');
       } else {
@@ -54,34 +75,39 @@ export default function App() {
   const handleUserSession = useCallback(async (currentUser: any) => {
     try {
       setUser(currentUser);
+      
+      const params = new URLSearchParams(window.location.search);
+      const roomFromUrl = params.get('room');
+      const pendingRoom = sessionStorage.getItem('lm_pending_room');
+      const finalRoom = pendingRoom || roomFromUrl;
+      
+      if (finalRoom?.length === 6) {
+        setMeetingCode(finalRoom);
+        if (pendingRoom) sessionStorage.removeItem('lm_pending_room');
+      }
+
       if (currentUser) {
         setGuestMode(false);
-
         const pendingHash = sessionStorage.getItem('lm_pending_hash');
         if (pendingHash) {
           sessionStorage.removeItem('lm_pending_hash');
           window.location.hash = pendingHash;
         }
 
-        const pendingRoom = sessionStorage.getItem('lm_pending_room');
-        if (pendingRoom) {
-          sessionStorage.removeItem('lm_pending_room');
-          setMeetingCode(pendingRoom);
-          const url = new URL(window.location.href);
-          url.searchParams.set('room', pendingRoom);
-          window.history.replaceState({}, '', url);
+        let profile = await dbService.getProfile(currentUser.id);
+        if (!profile) {
+          const savedLocal = localStorage.getItem(`lm_profile_${currentUser.id}`);
+          if (savedLocal) {
+            try { profile = JSON.parse(savedLocal); } catch (e) {}
+          }
         }
 
-        let profile: Profile | null = null;
-        const savedProfile = localStorage.getItem(`lm_profile_${currentUser.id}`);
-        if (savedProfile) { try { profile = JSON.parse(savedProfile); } catch (e) {} }
-        
         if (!profile) {
           const metadata = currentUser.user_metadata;
           profile = {
             id: currentUser.id,
             name: metadata.full_name || metadata.name || currentUser.email?.split('@')[0] || "New Member",
-            headline: "Ready to network",
+            headline: "Identity Required",
             about: "Add your LinkedIn URL below to generate your professional card.",
             skills: [],
             interests: [],
@@ -89,19 +115,10 @@ export default function App() {
             imageUrl: metadata.avatar_url || `https://api.dicebear.com/7.x/initials/svg?seed=${currentUser.id}`,
             lastUpdated: Date.now()
           };
-          localStorage.setItem(`lm_profile_${currentUser.id}`, JSON.stringify(profile));
         }
+
         setMyProfile(profile);
         setLinkedinUrl(profile.linkedinUrl || '');
-        
-        const params = new URLSearchParams(window.location.search);
-        const room = params.get('room');
-        if (room?.length === 6) {
-          setMeetingCode(room);
-          if (window.location.hash !== '#/app/linkpro') {
-            window.location.hash = '#/app/linkpro';
-          }
-        }
         refreshCloudHistory(currentUser.id);
       } else {
         const guestId = sessionStorage.getItem('lm_guest_id');
@@ -109,26 +126,45 @@ export default function App() {
           const savedGuest = localStorage.getItem(`lm_profile_${guestId}`);
           if (savedGuest) { try { setMyProfile(JSON.parse(savedGuest)); } catch (e) {} }
         }
-        setRole('none');
       }
-    } catch (e) {} finally { setIsHydrating(false); }
+    } catch (e) {
+      console.error("LinkPro: Session sync error", e);
+    } finally {
+      setIsHydrating(false);
+    }
   }, []);
 
   useEffect(() => {
+    const hydrationTimeout = setTimeout(() => {
+      if (isHydrating) setIsHydrating(false);
+    }, 2500);
+
     const init = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      await handleUserSession(session?.user ?? null);
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        await handleUserSession(session?.user ?? null);
+      } catch (e) {
+        setIsHydrating(false);
+      }
     };
+
     init();
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_, session) => handleUserSession(session?.user ?? null));
-    return () => subscription.unsubscribe();
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_, session) => {
+      handleUserSession(session?.user ?? null);
+    });
+
+    return () => {
+      subscription.unsubscribe();
+      clearTimeout(hydrationTimeout);
+    };
   }, [handleUserSession]);
 
   const refreshCloudHistory = async (userId: string) => {
     try {
       const [hosted, joined] = await Promise.all([
-        dbService.getHostedMeetings(userId), 
-        dbService.getParticipatedMeetings(userId)
+        dbService.getHostedMeetings(userId).catch(() => []), 
+        dbService.getParticipatedMeetings(userId).catch(() => [])
       ]);
       setHostHistory(hosted);
       setParticipantHistory(joined);
@@ -137,37 +173,29 @@ export default function App() {
 
   useEffect(() => {
     let interval: number;
-    if (activeView === 'linkmatch' && role !== 'none' && meetingCode && !isTestMode) {
+    if (activeView === 'linkmatch' && !isHydrating && meetingCode && role !== 'none' && !isTestMode) {
       const sync = async () => {
         const data = await dbService.getMeeting(meetingCode);
         if (data) {
           const currentUserId = user?.id || myProfile?.id;
           const currentParticipants = data.participants || [];
-          const stillActive = currentParticipants.some((p: any) => String(p.userId || p.id) === String(currentUserId));
-          
-          if (!stillActive && role !== 'host') {
-            exitRoom();
-            alert("The host has removed you from this board.");
-            return;
-          }
-
           setParticipants(currentParticipants);
           setMeetingName(data.name || '');
-          if (String(data.hostId) === String(currentUserId)) setRole('host');
-          else setRole('participant');
-        } else {
-          exitRoom();
-          alert("This board no longer exists.");
+          if (String(data.hostId) === String(currentUserId)) {
+            setRole('host');
+          } else if (currentParticipants.some((p: any) => String(p.userId || p.id) === String(currentUserId))) {
+            setRole('participant');
+          }
         }
       };
       sync();
       interval = window.setInterval(sync, 4000);
     }
     return () => clearInterval(interval);
-  }, [role, meetingCode, isTestMode, user, myProfile, activeView]);
+  }, [meetingCode, isTestMode, user, myProfile, activeView, isHydrating, role]);
 
   useEffect(() => {
-    if (activeView !== 'linkmatch' || isTestMode) return;
+    if (activeView !== 'linkmatch' || isTestMode || isHydrating || role === 'none') return;
     const participantFingerprint = participants.map(p => p.id).sort().join(",");
     if (participants.length >= 2 && !isAnalyzing && participantFingerprint !== lastAnalyzedFingerprint.current) {
       const runAI = async () => {
@@ -180,7 +208,7 @@ export default function App() {
       };
       runAI();
     }
-  }, [participants, isAnalyzing, isTestMode, activeView]);
+  }, [participants, isAnalyzing, isTestMode, activeView, isHydrating, role]);
 
   const handleLinkLinkedInProfile = async () => {
     if (!linkedinUrl.trim()) return alert("Please enter a LinkedIn URL");
@@ -191,16 +219,22 @@ export default function App() {
       const userId = user?.id || myProfile?.id || profile.id;
       const finalProfile = { ...profile, id: userId };
       setMyProfile(finalProfile);
-      if (user) localStorage.setItem(`lm_profile_${user.id}`, JSON.stringify(finalProfile));
-      if (meetingCode && role !== 'none') await dbService.joinMeeting(meetingCode, finalProfile, userId);
+      if (user) {
+        localStorage.setItem(`lm_profile_${user.id}`, JSON.stringify(finalProfile));
+        await dbService.upsertProfile(user.id, finalProfile);
+      }
+      if (meetingCode && role !== 'none') {
+        await dbService.joinMeeting(meetingCode, finalProfile, userId);
+      }
     } catch (e: any) {
-      alert("Failed to research profile: " + e.message);
+      alert("Profile enrichment failed. Please check your URL.");
     } finally { setLoading(false); }
   };
 
   const handleHostCreate = async () => {
     if (!user) return alert("Please sign in to host a board.");
-    if (!meetingName.trim()) return alert("Please name your board first.");
+    if (!myProfile?.linkedinUrl) return alert("Complete your Identity Card first.");
+    if (!meetingName.trim()) return alert("Please name your board.");
     setLoading(true);
     try {
       const code = await dbService.createMeeting(meetingName, user.id);
@@ -209,38 +243,63 @@ export default function App() {
       if (myProfile) await dbService.joinMeeting(code, { ...myProfile, id: user.id }, user.id);
       await refreshCloudHistory(user.id);
     } catch (e: any) {
-      alert("Host failed: " + e.message);
+      alert("Failed to create board.");
     } finally { setLoading(false); }
   };
 
   const handleJoinRoom = async (codeOverride?: string) => {
     const targetCode = codeOverride || meetingCode;
-    if (!targetCode || targetCode.length !== 6) return alert("Invalid code");
-    if (!myProfile) return alert("Build profile first");
+    if (!targetCode || targetCode.length !== 6) return alert("Invalid code format");
+    
+    // MANDATORY IDENTITY CHECK
+    if (!myProfile || !myProfile.linkedinUrl) {
+      return alert("Professional Identity Required. Please enter and sync your LinkedIn URL in the Identity Card before joining the terminal.");
+    }
+
     setLoading(true);
     try {
       const userId = user?.id || myProfile.id;
       await dbService.joinMeeting(targetCode, { ...myProfile, id: userId }, userId);
       const roomData = await dbService.getMeeting(targetCode);
-      if (!roomData) throw new Error("Room not found.");
+      if (!roomData) throw new Error("Terminal not found.");
+      
       setMeetingCode(targetCode);
-      setMeetingName(roomData.name || 'Live Board');
+      setMeetingName(roomData.name || 'Networking Board');
       setRole(String(roomData.hostId) === String(userId) ? 'host' : 'participant'); 
+      
       const url = new URL(window.location.href);
       url.searchParams.set('room', targetCode);
       window.history.replaceState({}, '', url);
     } catch (e: any) { alert(e.message); } finally { setLoading(false); }
   };
 
-  const handleDeleteMeeting = async () => {
-    if (!confirm("Are you sure you want to PERMANENTLY delete this meeting terminal and all its data?")) return;
+  const handleDeleteMeeting = async (codeOverride?: string) => {
+    const targetCode = codeOverride || meetingCode;
+    const confirmMsg = "CRITICAL: You are the OWNER of this terminal. Destroying it will disconnect ALL participants and permanently erase the board. Are you absolutely sure you want to delete this room?";
+    if (!confirm(confirmMsg)) return;
+    
     setLoading(true);
     try {
-      await dbService.deleteMeeting(meetingCode, user.id);
-      exitRoom();
-      if (user) refreshCloudHistory(user.id);
+      await dbService.deleteMeeting(targetCode, user.id);
+      if (targetCode === meetingCode) exitRoom();
+      if (user) await refreshCloudHistory(user.id);
     } catch (e: any) {
-      alert("Delete failed: " + e.message);
+      alert(e.message);
+    } finally { setLoading(false); }
+  };
+
+  const handleLeaveMeeting = async (code: string) => {
+    const confirmMsg = "LEAVE TERMINAL: Your professional card will be removed from this board immediately and it will disappear from your history. You will need the code to reconnect later. Confirm leave?";
+    if (!confirm(confirmMsg)) return;
+
+    setLoading(true);
+    try {
+      const userId = user?.id || myProfile?.id;
+      if (!userId) throw new Error("Not logged in");
+      await dbService.removeParticipant(code, userId);
+      if (user) await refreshCloudHistory(user.id);
+    } catch (e: any) {
+      alert(e.message);
     } finally { setLoading(false); }
   };
 
@@ -293,11 +352,11 @@ export default function App() {
             </div>
             <div className="flex items-center gap-8">
               {user ? (
-                <div className="flex items-center gap-4 bg-slate-900/40 backdrop-blur-3xl border border-white/5 pl-2 pr-8 py-2 rounded-full shadow-2xl">
+                <div className="flex items-center gap-4 bg-slate-900/40 backdrop-blur-3xl border border-white/5 pl-2 pr-6 py-2 rounded-full shadow-2xl">
                   <img src={user.user_metadata.avatar_url} className="w-11 h-11 rounded-full border-2 border-indigo-500/40" alt="" />
-                  <div>
-                    <p className="text-[9px] font-black uppercase text-slate-500 tracking-widest">Active Pilot</p>
+                  <div className="flex flex-col">
                     <p className="text-sm font-black text-white">{user.user_metadata.full_name}</p>
+                    <button onClick={() => dbService.signOut()} className="text-[9px] font-black uppercase text-indigo-400 tracking-widest text-left hover:text-white transition-colors mt-1">Sign Out</button>
                   </div>
                 </div>
               ) : (
@@ -319,62 +378,32 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-10">
-              <div 
-                onClick={launchLinkPro}
-                className="group relative h-[500px] bg-slate-900/60 backdrop-blur-md border border-white/5 rounded-[4rem] p-12 flex flex-col justify-between cursor-pointer hover:border-white/20 hover:bg-slate-900/80 transition-all duration-500 overflow-hidden shadow-2xl"
-              >
-                <div className="absolute inset-0 bg-gradient-to-br from-indigo-600/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
-                <div>
-                  <div className="w-20 h-20 bg-indigo-600 rounded-[2rem] flex items-center justify-center font-black text-3xl shadow-[0_0_40px_rgba(79,70,229,0.3)] group-hover:scale-110 transition-transform duration-700">LP</div>
-                  <h3 className="mt-10 text-4xl font-black tracking-tight">LinkPro</h3>
-                  <p className="mt-6 text-slate-400 leading-relaxed text-base font-medium">
-                    Real-time networking intelligence. Generate dynamic professional cards, find board-wide synergies, and automate follow-ups with Gemini AI.
-                  </p>
-                </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex flex-col">
-                    <span className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-1">Status</span>
-                    <span className="text-xs font-black text-white uppercase tracking-widest">Operational</span>
+              {FEATURE_FLAGS.LINKPRO && (
+                <div 
+                  onClick={launchLinkPro}
+                  className="group relative h-[500px] bg-slate-900/60 backdrop-blur-md border border-white/5 rounded-[4rem] p-12 flex flex-col justify-between cursor-pointer hover:border-white/20 hover:bg-slate-900/80 transition-all duration-500 overflow-hidden shadow-2xl"
+                >
+                  <div className="absolute inset-0 bg-gradient-to-br from-indigo-600/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
+                  <div>
+                    <div className="w-20 h-20 bg-indigo-600 rounded-[2rem] flex items-center justify-center font-black text-3xl shadow-[0_0_40px_rgba(79,70,229,0.3)] group-hover:scale-110 transition-transform duration-700">LP</div>
+                    <h3 className="mt-10 text-4xl font-black tracking-tight">LinkPro</h3>
+                    <p className="mt-6 text-slate-400 leading-relaxed text-base font-medium">
+                      Real-time networking intelligence. Generate dynamic professional cards, find board-wide synergies, and automate follow-ups with Gemini AI.
+                    </p>
                   </div>
-                  <div className="w-14 h-14 rounded-full bg-white/5 border border-white/10 flex items-center justify-center group-hover:bg-white group-hover:text-black transition-all duration-500">
-                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
+                  <div className="flex items-center justify-between">
+                    <div className="flex flex-col">
+                      <span className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-1">Status</span>
+                      <span className="text-xs font-black text-white uppercase tracking-widest">Operational</span>
+                    </div>
+                    <div className="w-14 h-14 rounded-full bg-white/5 border border-white/10 flex items-center justify-center group-hover:bg-white group-hover:text-black transition-all duration-500">
+                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M17 8l4 4m0 0l-4 4m4-4H3" /></svg>
+                    </div>
                   </div>
                 </div>
-              </div>
-
-              <div className="relative h-[500px] bg-slate-900/10 border border-white/5 rounded-[4rem] p-12 flex flex-col justify-between grayscale opacity-30 contrast-75 overflow-hidden cursor-not-allowed">
-                <div>
-                  <div className="w-20 h-20 bg-slate-800 rounded-[2rem] flex items-center justify-center font-black text-3xl text-slate-600">RI</div>
-                  <h3 className="mt-10 text-4xl font-black tracking-tight text-slate-500">Resume Intel</h3>
-                  <p className="mt-6 text-slate-600 leading-relaxed text-base font-medium">
-                    Optimize your career narrative with AI-driven scoring and keyword targeting for modern ATS systems.
-                  </p>
-                </div>
-                <span className="px-6 py-2 bg-slate-800 text-slate-500 rounded-full text-[10px] font-black uppercase tracking-widest self-start">Coming Soon</span>
-              </div>
-
-              <div className="relative h-[500px] bg-slate-900/10 border border-white/5 rounded-[4rem] p-12 flex flex-col justify-between grayscale opacity-30 contrast-75 overflow-hidden cursor-not-allowed">
-                <div>
-                  <div className="w-20 h-20 bg-slate-800 rounded-[2rem] flex items-center justify-center font-black text-3xl text-slate-600">VD</div>
-                  <h3 className="mt-10 text-4xl font-black tracking-tight text-slate-500">Vision Deck</h3>
-                  <p className="mt-6 text-slate-600 leading-relaxed text-base font-medium">
-                    A collaborative virtual canvas for founders to build technical roadmaps with real-time AI architectural feedback.
-                  </p>
-                </div>
-                <span className="px-6 py-2 bg-slate-800 text-slate-500 rounded-full text-[10px] font-black uppercase tracking-widest self-start">Planned</span>
-              </div>
+              )}
             </div>
           </main>
-
-          <footer className="mt-48 pt-16 border-t border-white/5 flex flex-col md:flex-row justify-between items-center gap-12 text-slate-600">
-            <div className="flex flex-col gap-2">
-              <p className="text-[11px] font-black uppercase tracking-[0.4em]">© 2025 TechAIPro Corporation</p>
-            </div>
-            <div className="flex flex-col items-end gap-2 text-right">
-              <p className="text-[9px] font-black uppercase tracking-widest text-slate-700">Environment Deployment</p>
-              <p className="text-[10px] font-medium font-mono text-indigo-500/50">{window.location.origin}</p>
-            </div>
-          </footer>
         </div>
       </div>
     );
@@ -385,7 +414,7 @@ export default function App() {
       return (
         <div className="min-h-screen bg-[#020617] flex flex-col items-center justify-center gap-6">
           <div className="w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-          <p className="text-slate-500 text-[10px] font-black uppercase tracking-[0.3em] animate-pulse">Initializing LinkPro Environment</p>
+          <p className="text-slate-500 text-[10px] font-black uppercase tracking-[0.3em] animate-pulse">Synchronizing Identity Data</p>
         </div>
       );
     }
@@ -415,6 +444,11 @@ export default function App() {
     }
 
     if (role === 'none') {
+      const isProfileSynced = !!myProfile?.linkedinUrl;
+      const filteredParticipantHistory = participantHistory.filter(
+        p => !hostHistory.some(h => h.code === p.code)
+      );
+
       return (
         <div className="min-h-screen bg-[#020617] text-white p-12 font-inter">
           <div className="max-w-7xl mx-auto">
@@ -428,6 +462,7 @@ export default function App() {
                   <p className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mt-1">Networking Dashboard</p>
                 </div>
               </div>
+
               <div className="flex items-center gap-6 bg-slate-900/60 p-2 pr-8 rounded-full border border-white/5 shadow-2xl">
                 {user ? (
                   <>
@@ -435,7 +470,7 @@ export default function App() {
                     <button onClick={() => dbService.signOut()} className="text-[10px] font-black text-slate-500 uppercase tracking-widest hover:text-red-400 transition-colors">Sign Out</button>
                   </>
                 ) : (
-                  <button onClick={() => setGuestMode(false)} className="px-8 py-2.5 bg-white text-black rounded-full text-[10px] font-black uppercase tracking-widest">Connect</button>
+                  <button onClick={() => setGuestMode(false)} className="px-8 py-2.5 bg-white text-black rounded-full text-[10px] font-black uppercase tracking-widest">Connect Session</button>
                 )}
               </div>
             </header>
@@ -454,61 +489,140 @@ export default function App() {
                     </div>
                   )}
                   <div className="space-y-5">
+                    <p className="text-[10px] font-black text-indigo-400 uppercase tracking-widest px-1">LinkedIn URL</p>
                     <input placeholder="linkedin.com/in/username" className="w-full bg-slate-950/60 border border-slate-800 rounded-2xl px-8 py-6 text-sm outline-none focus:ring-2 focus:ring-indigo-500/40 transition-all text-slate-200" value={linkedinUrl} onChange={(e) => setLinkedinUrl(e.target.value)} />
-                    <button onClick={handleLinkLinkedInProfile} disabled={loading} className={`w-full py-6 rounded-2xl font-black text-xs uppercase tracking-[0.3em] transition-all shadow-2xl ${loading ? 'bg-indigo-900 text-indigo-400 animate-pulse' : 'bg-white text-black hover:bg-slate-200 active:scale-95'}`}>{loading ? 'Researching...' : 'Sync Profile'}</button>
+                    <button onClick={handleLinkLinkedInProfile} disabled={loading} className={`w-full py-6 rounded-2xl font-black text-xs uppercase tracking-[0.3em] transition-all shadow-2xl ${loading ? 'bg-indigo-900 text-indigo-400 animate-pulse' : 'bg-white text-black hover:bg-slate-200 active:scale-95'}`}>{loading ? 'Syncing...' : 'Sync Identity'}</button>
                   </div>
                 </div>
 
                 <div className="bg-slate-900/20 border border-white/5 p-10 rounded-[3rem] space-y-8 backdrop-blur-md">
-                  <h2 className="text-xl font-black tracking-tight">Board Management</h2>
+                  <h2 className="text-xl font-black tracking-tight">Terminal Control</h2>
+                  
+                  {!isProfileSynced && (
+                    <div className="p-6 bg-amber-500/10 border border-amber-500/20 rounded-3xl animate-in">
+                      <p className="text-[10px] text-amber-500 font-black uppercase tracking-widest leading-relaxed">
+                        ⚠️ Identity Required: You must sync your professional identity before connecting to any terminals.
+                      </p>
+                    </div>
+                  )}
+
                   <div className="space-y-5">
                     <div className="p-8 bg-slate-950/40 rounded-[2.8rem] border border-white/5">
-                      <p className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-6 px-1">Host Event</p>
-                      <input placeholder="Board Title" className="w-full bg-slate-900/60 border border-slate-800 rounded-2xl px-6 py-5 text-sm outline-none mb-5 focus:ring-2 focus:ring-indigo-500/40" value={meetingName} onChange={(e) => setMeetingName(e.target.value)} />
-                      <button onClick={handleHostCreate} disabled={loading || !myProfile || !user} className="w-full bg-indigo-600 py-5 rounded-2xl font-black text-[10px] uppercase tracking-[0.3em] hover:bg-indigo-500 disabled:opacity-30 shadow-xl shadow-indigo-600/20 active:scale-95 transition-all">Create Terminal</button>
+                      <p className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-6 px-1">Initialize New Board</p>
+                      <input placeholder="Terminal Name" className="w-full bg-slate-900/60 border border-slate-800 rounded-2xl px-6 py-5 text-sm outline-none mb-5 focus:ring-2 focus:ring-indigo-500/40" value={meetingName} onChange={(e) => setMeetingName(e.target.value)} />
+                      <button 
+                        onClick={handleHostCreate} 
+                        disabled={loading || !isProfileSynced} 
+                        className="w-full bg-indigo-600 py-5 rounded-2xl font-black text-[10px] uppercase tracking-[0.3em] hover:bg-indigo-500 disabled:opacity-30 disabled:grayscale shadow-xl shadow-indigo-600/20 active:scale-95 transition-all"
+                      >
+                        Create Terminal
+                      </button>
                     </div>
                     <div className="p-8 bg-emerald-500/5 rounded-[2.8rem] border border-emerald-500/10">
-                      <p className="text-[10px] font-black text-emerald-400 uppercase tracking-widest mb-6 px-1">Join Existing</p>
+                      <p className="text-[10px] font-black text-emerald-400 uppercase tracking-widest mb-6 px-1">Connect to Existing</p>
+                      
+                      {meetingCode.length === 6 && (
+                        <div className="mb-4 bg-indigo-600/10 p-3 rounded-xl border border-indigo-500/20 flex items-center gap-3">
+                           <div className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></div>
+                           <p className="text-[9px] font-black text-indigo-300 uppercase tracking-widest">Target Locked</p>
+                        </div>
+                      )}
+
                       <input placeholder="000 000" className="w-full bg-slate-900/60 border border-slate-800 rounded-2xl px-6 py-5 text-center text-2xl font-black tracking-[0.5em] mb-5 outline-none focus:ring-2 focus:ring-emerald-500/40" value={meetingCode} maxLength={6} onChange={(e) => setMeetingCode(e.target.value.replace(/\D/g, ''))} />
-                      <button onClick={() => handleJoinRoom()} disabled={loading || !myProfile} className="w-full bg-emerald-600 py-5 rounded-2xl font-black text-[10px] uppercase tracking-[0.3em] hover:bg-emerald-500 disabled:opacity-30 active:scale-95 transition-all">Link To Terminal</button>
+                      <button 
+                        onClick={() => handleJoinRoom()} 
+                        disabled={loading || !isProfileSynced} 
+                        className="w-full bg-emerald-600 py-5 rounded-2xl font-black text-[10px] uppercase tracking-[0.3em] hover:bg-emerald-500 disabled:opacity-30 disabled:grayscale active:scale-95 transition-all"
+                      >
+                        Link To Terminal
+                      </button>
                     </div>
                   </div>
                 </div>
               </div>
 
               <div className="lg:col-span-8 space-y-16">
-                {user && (
-                  <div className="space-y-16">
-                    {hostHistory.length > 0 && (
-                      <section>
-                        <h3 className="text-[11px] font-black text-indigo-400 uppercase tracking-[0.4em] mb-10 px-4">Proprietary Terminals</h3>
+                {user ? (
+                  <div className="space-y-20">
+                    {/* COMMANDED TERMINALS SECTION */}
+                    <section className="animate-in" style={{ animationDelay: '100ms' }}>
+                      <h3 className="text-[11px] font-black text-indigo-400 uppercase tracking-[0.4em] mb-10 px-4 flex items-center gap-4">
+                        Commanded Terminals
+                        <span className="w-2 h-2 rounded-full bg-indigo-500"></span>
+                        <span className="text-slate-700 normal-case tracking-normal">({hostHistory.length})</span>
+                      </h3>
+                      {hostHistory.length > 0 ? (
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                           {hostHistory.map(h => (
-                            <button key={h.code} onClick={() => handleJoinRoom(h.code)} className="p-10 bg-slate-900/40 border border-white/5 rounded-[3rem] hover:border-white/20 hover:bg-slate-900 transition-all text-left shadow-xl group">
-                              <p className="text-2xl font-black group-hover:text-white transition-colors">{h.name}</p>
-                              <div className="flex items-center gap-3 mt-4">
-                                <span className="text-[10px] text-indigo-400 font-black uppercase tracking-widest">CODE: {h.code}</span>
-                                <span className="w-1 h-1 rounded-full bg-slate-700"></span>
-                                <span className="text-[10px] text-slate-500 font-black uppercase tracking-widest">OWNER</span>
-                              </div>
-                            </button>
+                            <div key={h.code} className="group relative">
+                              <button onClick={() => handleJoinRoom(h.code)} className="w-full p-10 bg-slate-900/40 border border-white/5 rounded-[3rem] hover:border-indigo-500/40 hover:bg-slate-900/60 transition-all text-left shadow-xl overflow-hidden">
+                                <span className="inline-block px-3 py-1 bg-indigo-600/20 text-indigo-400 text-[8px] font-black uppercase tracking-widest rounded-lg mb-4 border border-indigo-500/20">OWNER / HOST</span>
+                                <p className="text-2xl font-black group-hover:text-white transition-colors line-clamp-1 pr-10">{h.name}</p>
+                                <div className="flex items-center gap-4 mt-6">
+                                  <span className="text-[10px] bg-slate-950/60 px-3 py-1.5 rounded-lg text-indigo-400 font-black uppercase tracking-widest border border-white/5">CODE: {h.code}</span>
+                                  <span className="text-[10px] text-slate-600 font-black uppercase tracking-widest">{new Date(h.timestamp).toLocaleDateString()}</span>
+                                </div>
+                              </button>
+                              <button 
+                                onClick={(e) => { e.stopPropagation(); handleDeleteMeeting(h.code); }}
+                                className="absolute top-8 right-8 p-3 bg-red-500/10 text-red-500 rounded-2xl border border-red-500/20 hover:bg-red-500 hover:text-white transition-all opacity-0 group-hover:opacity-100 shadow-2xl"
+                                title="Destroy Terminal"
+                              >
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                              </button>
+                            </div>
                           ))}
                         </div>
-                      </section>
-                    )}
-                    {participantHistory.length > 0 && (
-                      <section>
-                        <h3 className="text-[11px] font-black text-emerald-400 uppercase tracking-[0.4em] mb-10 px-4">Shared Terminals</h3>
+                      ) : (
+                        <div className="p-16 border-2 border-dashed border-white/5 rounded-[3.5rem] text-center bg-slate-900/20">
+                          <p className="text-[11px] text-slate-600 font-black uppercase tracking-widest">No terminals initialized yet.</p>
+                        </div>
+                      )}
+                    </section>
+
+                    {/* CONNECTED TERMINALS SECTION */}
+                    <section className="animate-in" style={{ animationDelay: '200ms' }}>
+                      <h3 className="text-[11px] font-black text-emerald-400 uppercase tracking-[0.4em] mb-10 px-4 flex items-center gap-4">
+                        Connected Terminals
+                        <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                        <span className="text-slate-700 normal-case tracking-normal">({filteredParticipantHistory.length})</span>
+                      </h3>
+                      {filteredParticipantHistory.length > 0 ? (
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                          {participantHistory.map(h => (
-                            <button key={h.code} onClick={() => handleJoinRoom(h.code)} className="p-10 bg-slate-900/40 border border-white/5 rounded-[3rem] hover:border-emerald-500/30 transition-all text-left group shadow-xl">
-                              <p className="text-2xl font-black group-hover:text-emerald-400 transition-colors">{h.name}</p>
-                              <p className="text-[10px] text-slate-500 font-black mt-4 uppercase tracking-widest">CODE: {h.code}</p>
-                            </button>
+                          {filteredParticipantHistory.map(h => (
+                            <div key={h.code} className="group relative">
+                              <button onClick={() => handleJoinRoom(h.code)} className="w-full p-10 bg-slate-900/40 border border-white/5 rounded-[3rem] hover:border-emerald-500/40 hover:bg-slate-900/60 transition-all text-left shadow-xl overflow-hidden">
+                                <span className="inline-block px-3 py-1 bg-emerald-600/20 text-emerald-400 text-[8px] font-black uppercase tracking-widest rounded-lg mb-4 border border-emerald-500/20">MEMBER ONLY</span>
+                                <p className="text-2xl font-black group-hover:text-white transition-colors line-clamp-1 pr-10">{h.name}</p>
+                                <div className="flex items-center gap-4 mt-6">
+                                  <span className="text-[10px] bg-slate-950/60 px-3 py-1.5 rounded-lg text-emerald-400 font-black uppercase tracking-widest border border-white/5">CODE: {h.code}</span>
+                                  <span className="text-[10px] text-slate-600 font-black uppercase tracking-widest">{new Date(h.timestamp).toLocaleDateString()}</span>
+                                </div>
+                              </button>
+                              <button 
+                                onClick={(e) => { e.stopPropagation(); handleLeaveMeeting(h.code); }}
+                                className="absolute top-8 right-8 p-3 bg-emerald-500/10 text-emerald-500 rounded-2xl border border-emerald-500/20 hover:bg-emerald-500 hover:text-white transition-all opacity-0 group-hover:opacity-100 shadow-2xl"
+                                title="Forget Terminal"
+                              >
+                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+                              </button>
+                            </div>
                           ))}
                         </div>
-                      </section>
-                    )}
+                      ) : (
+                        <div className="p-16 border-2 border-dashed border-white/5 rounded-[3.5rem] text-center bg-slate-900/20">
+                          <p className="text-[11px] text-slate-600 font-black uppercase tracking-widest">No external connections found.</p>
+                        </div>
+                      )}
+                    </section>
+                  </div>
+                ) : (
+                  <div className="h-full flex items-center justify-center p-20 border-2 border-dashed border-white/5 rounded-[4rem] bg-slate-900/10">
+                    <div className="text-center">
+                       <svg className="w-16 h-16 text-slate-800 mx-auto mb-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                       <p className="text-[11px] text-slate-600 font-black uppercase tracking-widest">Synchronized Cloud Access Required</p>
+                       <button onClick={() => dbService.signInWithLinkedIn()} className="mt-8 px-10 py-4 bg-white text-black rounded-full text-[10px] font-black uppercase tracking-widest hover:scale-105 transition-transform">Initialize Cloud Sync</button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -551,24 +665,15 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-4">
-             <button 
-               onClick={copyInviteLink} 
-               className={`flex items-center gap-3 px-6 py-3.5 rounded-2xl text-[11px] font-black uppercase tracking-[0.2em] transition-all border ${copySuccess ? 'bg-emerald-500 text-white border-emerald-400' : 'bg-white text-black border-white hover:bg-slate-200'}`}
-             >
+             <button onClick={copyInviteLink} className={`flex items-center gap-3 px-6 py-3.5 rounded-2xl text-[11px] font-black uppercase tracking-[0.2em] transition-all border ${copySuccess ? 'bg-emerald-500 text-white border-emerald-400' : 'bg-white text-black border-white hover:bg-slate-200'}`}>
                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" /></svg>
                {copySuccess ? 'Link Copied' : 'Invite Members'}
              </button>
-
              {role === 'host' && (
-               <button 
-                 onClick={handleDeleteMeeting} 
-                 disabled={loading}
-                 className="px-6 py-3.5 bg-red-500/10 text-red-500 rounded-2xl text-[11px] font-black uppercase tracking-[0.2em] border border-red-500/20 hover:bg-red-500 hover:text-white transition-all disabled:opacity-30"
-               >
+               <button onClick={() => handleDeleteMeeting()} disabled={loading} className="px-6 py-3.5 bg-red-500/10 text-red-500 rounded-2xl text-[11px] font-black uppercase tracking-[0.2em] border border-red-500/20 hover:bg-red-500 hover:text-white transition-all disabled:opacity-30">
                  {loading ? 'Destroying...' : 'Destroy Terminal'}
                </button>
              )}
-
              <button onClick={exitRoom} className="px-6 py-3.5 bg-slate-800/40 text-slate-400 rounded-2xl text-[11px] font-black uppercase tracking-[0.2em] border border-white/5 hover:bg-slate-700 hover:text-white transition-all">Disconnect</button>
           </div>
         </header>

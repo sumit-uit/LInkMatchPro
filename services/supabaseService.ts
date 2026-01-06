@@ -1,24 +1,6 @@
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.45.0';
 
-/**
- * RECOMMENDED SUPABASE RLS POLICIES:
- * ---------------------------------
- * Table: meetings
- * 
- * 1. SELECT: "Anyone can view by code"
- *    USING: (true) 
- * 
- * 2. INSERT: "Authenticated users can create"
- *    WITH CHECK: (auth.role() = 'authenticated')
- * 
- * 3. UPDATE: "Host or authenticated user can update"
- *    USING: ((data ->> 'hostId'::text) = (auth.uid())::text OR auth.role() = 'authenticated')
- * 
- * 4. DELETE: "Only host can delete"
- *    USING: ((data ->> 'hostId'::text) = (auth.uid())::text)
- */
-
 const SUPABASE_URL = 'https://mitphvsxzgwxvtshpgqw.supabase.co'; 
 const SUPABASE_KEY = 'sb_publishable_GSAUyX-e1wAaeYDnQ3aEYg_BVXW9L09';
 
@@ -46,23 +28,15 @@ export const dbService = {
       }
     });
     
-    if (error) {
-      console.error("Supabase OAuth Error:", error);
-      throw error;
-    }
-    
-    if (data?.url) {
-      window.location.assign(data.url);
-    }
+    if (error) throw error;
+    if (data?.url) window.location.assign(data.url);
   },
 
   async signOut() {
     try {
-      const signoutPromise = supabase.auth.signOut();
-      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Signout timeout")), 2000));
-      await Promise.race([signoutPromise, timeoutPromise]);
+      await supabase.auth.signOut();
     } catch (e) {
-      console.warn("Graceful signout warning:", e);
+      console.warn("Signout warning:", e);
     } finally {
       localStorage.clear();
       sessionStorage.clear();
@@ -71,6 +45,52 @@ export const dbService = {
     }
   },
 
+  /**
+   * PERSISTENT PROFILES
+   */
+  async upsertProfile(userId: string, profile: any) {
+    try {
+      const { error } = await supabase
+        .from('profiles')
+        .upsert({
+          id: userId,
+          data: profile,
+          updated_at: new Date().toISOString()
+        });
+      
+      if (error) {
+        console.warn("Table 'profiles' might be missing. Run SQL migration.", error.message);
+      }
+    } catch (e) {
+      console.error("Profile upsert failed", e);
+    }
+  },
+
+  async getProfile(userId: string) {
+    try {
+      // Adding a 5s race-timeout for DB fetch
+      const fetchPromise = supabase
+        .from('profiles')
+        .select('data')
+        .eq('id', userId)
+        .maybeSingle();
+
+      const { data, error } = await fetchPromise;
+      
+      if (error) {
+        if (error.code === 'PGRST116') return null; // Expected for new users
+        console.warn("Database error in getProfile. Table might not exist.", error.message);
+        return null;
+      }
+      return data?.data || null;
+    } catch (e) {
+      return null;
+    }
+  },
+
+  /**
+   * MEETINGS
+   */
   async createMeeting(name: string, hostId: string): Promise<string> {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     
@@ -82,8 +102,8 @@ export const dbService = {
     });
 
     if (error) {
-      console.error("Supabase Insert Error:", error);
-      throw new Error(error.message || "Failed to initialize room database record.");
+      console.error("Create Meeting Error:", error.message);
+      throw new Error("Failed to create board. Make sure 'meetings' table exists.");
     }
     
     return code;
@@ -141,7 +161,7 @@ export const dbService = {
       .update({ data: { ...meetingData, participants: updatedParticipants } })
       .eq('id', code);
       
-    if (updateError) throw new Error(`Sync failed: ${updateError.message}`);
+    if (updateError) throw updateError;
     return true;
   },
 
@@ -184,14 +204,12 @@ export const dbService = {
         status: record.status
       };
     } catch (e) {
-      console.error("getMeeting error", e);
       return null;
     }
   },
 
   async getHostedMeetings(userId: string) {
     try {
-      // Use direct JSONB path filtering for better performance with RLS
       const { data, error } = await supabase
         .from('meetings')
         .select('id, name, status, created_at')
@@ -218,7 +236,6 @@ export const dbService = {
         .order('created_at', { ascending: false });
       if (error) return [];
       
-      // Local filtering for participated meetings to handle JSONB array logic
       return data
         .filter(m => (m.data as any).participants?.some((p: any) => String(p.userId || p.id) === String(userId)))
         .map(m => ({

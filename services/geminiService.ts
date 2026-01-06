@@ -54,10 +54,8 @@ function extractJson(text: string): any {
 
 /**
  * Direct enrichment using Gemini 3 Flash. 
- * Using 'gemini-3-flash-preview' for better rate limits and speed.
  */
 export const enrichProfile = async (url: string): Promise<Profile> => {
-  // Guidelines: Always create a new GoogleGenAI instance right before making an API call.
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const profileId = hashString(url);
   const slug = url.split('/in/')[1]?.split('/')[0]?.replace(/[-_0-9]/g, ' ').trim() || '';
@@ -85,7 +83,6 @@ export const enrichProfile = async (url: string): Promise<Profile> => {
     const data = extractJson(response.text || '');
     if (!data) throw new Error("No data found");
 
-    // Extract Grounding URLs for attribution
     const sources: ProfileSource[] = [];
     const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
     if (chunks) {
@@ -112,12 +109,11 @@ export const enrichProfile = async (url: string): Promise<Profile> => {
       sources: sources.length > 0 ? sources : undefined
     };
   } catch (error: any) {
-    console.error("Enrichment error:", error);
     return {
       id: profileId,
       name: searchName || "LinkedIn Member",
       headline: "Network Member",
-      about: "Information currently limited due to system load. Connect to learn more about this member's background.",
+      about: "Information currently limited. Connect to learn more.",
       skills: ["Networking"],
       interests: ["Tech"],
       linkedinUrl: url,
@@ -132,14 +128,9 @@ export const enrichProfile = async (url: string): Promise<Profile> => {
  */
 export const analyzeRoomSynergies = async (profiles: Profile[]): Promise<NetworkingSynergy[]> => {
   if (profiles.length < 2) return [];
-  
-  // Guidelines: Always create a new GoogleGenAI instance right before making an API call.
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   try {
-    const processingLimit = 15;
-    const targetProfiles = profiles.slice(0, processingLimit);
-
-    const simplifiedProfiles = targetProfiles.map(p => ({
+    const simplifiedProfiles = profiles.slice(0, 15).map(p => ({
       id: String(p.id),
       name: p.name,
       headline: p.headline,
@@ -172,7 +163,6 @@ export const analyzeRoomSynergies = async (profiles: Profile[]): Promise<Network
     const results = extractJson(response.text || '[]');
     return Array.isArray(results) ? results : [];
   } catch (error) {
-    console.error("Synergy Error:", error);
     return [];
   }
 };
